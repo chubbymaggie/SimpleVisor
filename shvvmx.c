@@ -22,12 +22,43 @@ Environment:
 
 #include "shv.h"
 
-BOOLEAN
+VOID
+ShvVmxEptInitialize (
+    _In_ PSHV_VP_DATA VpData
+    )
+{
+    UINT64 i;
+    VMX_HUGE_PDPTE tempEpdpte;
+
+    //
+    // Fill out the EPML4E which covers the first 512GB of RAM
+    //
+    VpData->Epml4[0].Read = 1;
+    VpData->Epml4[0].Write = 1;
+    VpData->Epml4[0].Execute = 1;
+    VpData->Epml4[0].PageFrameNumber = ShvOsGetPhysicalAddress(&VpData->Epdpt) / PAGE_SIZE;
+
+    //
+    // Fill out a RWX Write-back 1GB EPDPTE
+    //
+    tempEpdpte.AsUlonglong = 0;
+    tempEpdpte.Read = tempEpdpte.Write = tempEpdpte.Execute = 1;
+    tempEpdpte.Type = MTRR_TYPE_WB;
+    tempEpdpte.Large = 1;
+
+    //
+    // Construct EPT identity map for every 1GB of RAM
+    //
+    __stosq((UINT64*)VpData->Epdpt, tempEpdpte.AsUlonglong, PDPTE_ENTRY_COUNT);
+    for (i = 0; i < PDPTE_ENTRY_COUNT; i++) VpData->Epdpt[i].PageFrameNumber = i;
+}
+
+UINT8
 ShvVmxEnterRootModeOnVp (
     _In_ PSHV_VP_DATA VpData
     )
 {
-    PKSPECIAL_REGISTERS Registers = &VpData->HostState.SpecialRegisters;
+    PSHV_SPECIAL_REGISTERS Registers = &VpData->SpecialRegisters;
 
     //
     // Ensure the the VMCS can fit into a single page
@@ -54,6 +85,19 @@ ShvVmxEnterRootModeOnVp (
     }
 
     //
+    // Ensure that EPT is available with the needed features SimpleVisor uses
+    //
+    if (((VpData->MsrData[12].QuadPart & VMX_EPT_PAGE_WALK_4_BIT) != 0) &&
+        ((VpData->MsrData[12].QuadPart & VMX_EPTP_WB_BIT) != 0) &&
+        ((VpData->MsrData[12].QuadPart & VMX_EPT_1GB_PAGE_BIT) != 0))
+    {
+        //
+        // Enable EPT if these features are supported
+        //
+        VpData->EptControls = SECONDARY_EXEC_ENABLE_EPT | SECONDARY_EXEC_ENABLE_VPID;
+    }
+
+    //
     // Capture the revision ID for the VMXON and VMCS region
     //
     VpData->VmxOn.RevisionId = VpData->MsrData[0].LowPart;
@@ -62,9 +106,10 @@ ShvVmxEnterRootModeOnVp (
     //
     // Store the physical addresses of all per-LP structures allocated
     //
-    VpData->VmxOnPhysicalAddress = MmGetPhysicalAddress(&VpData->VmxOn).QuadPart;
-    VpData->VmcsPhysicalAddress = MmGetPhysicalAddress(&VpData->Vmcs).QuadPart;
-    VpData->MsrBitmapPhysicalAddress = MmGetPhysicalAddress(ShvGlobalData->MsrBitmap).QuadPart;
+    VpData->VmxOnPhysicalAddress = ShvOsGetPhysicalAddress(&VpData->VmxOn);
+    VpData->VmcsPhysicalAddress = ShvOsGetPhysicalAddress(&VpData->Vmcs);
+    VpData->MsrBitmapPhysicalAddress = ShvOsGetPhysicalAddress(VpData->MsrBitmap);
+    VpData->EptPml4PhysicalAddress = ShvOsGetPhysicalAddress(&VpData->Epml4);
 
     //
     // Update CR0 with the must-be-zero and must-be-one requirements
@@ -119,17 +164,43 @@ ShvVmxSetupVmcsForVp (
     _In_ PSHV_VP_DATA VpData
     )
 {
-    PKPROCESSOR_STATE state = &VpData->HostState;
+    PSHV_SPECIAL_REGISTERS state = &VpData->SpecialRegisters;
+    PCONTEXT context = &VpData->ContextFrame;
     VMX_GDTENTRY64 vmxGdtEntry;
+    VMX_EPTP vmxEptp;
 
     //
     // Begin by setting the link pointer to the required value for 4KB VMCS.
     //
-    __vmx_vmwrite(VMCS_LINK_POINTER, MAXULONG64);
+    __vmx_vmwrite(VMCS_LINK_POINTER, ~0ULL);
+
+    //
+    // Enable EPT features if supported
+    //
+    if (VpData->EptControls != 0)
+    {
+        //
+        // Configure the EPTP
+        //
+        vmxEptp.AsUlonglong = 0;
+        vmxEptp.PageWalkLength = 3;
+        vmxEptp.Type = MTRR_TYPE_WB;
+        vmxEptp.PageFrameNumber = VpData->EptPml4PhysicalAddress / PAGE_SIZE;
+
+        //
+        // Load EPT Root Pointer
+        //
+        __vmx_vmwrite(EPT_POINTER, vmxEptp.AsUlonglong);
+
+        //
+        // Set VPID to one
+        //
+        __vmx_vmwrite(VIRTUAL_PROCESSOR_ID, 1);
+    }
 
     //
     // Load the MSR bitmap. Unlike other bitmaps, not having an MSR bitmap will
-    // trap all MSRs, so have to allocate an empty one.
+    // trap all MSRs, so we allocated an empty one.
     //
     __vmx_vmwrite(MSR_BITMAP, VpData->MsrBitmapPhysicalAddress);
 
@@ -139,9 +210,14 @@ ShvVmxSetupVmcsForVp (
     // ShvUtilAdjustMsr, these options will be ignored if this processor does
     // not actully support the instructions to begin with.
     //
+    // Also enable EPT support, for additional performance and ability to trap
+    // memory access efficiently.
+    //
     __vmx_vmwrite(SECONDARY_VM_EXEC_CONTROL,
                            ShvUtilAdjustMsr(VpData->MsrData[11],
-                                            SECONDARY_EXEC_ENABLE_RDTSCP | SECONDARY_EXEC_XSAVES));
+                                            SECONDARY_EXEC_ENABLE_RDTSCP |
+                                            SECONDARY_EXEC_XSAVES |
+                                            VpData->EptControls));
 
     //
     // Enable no pin-based options ourselves, but there may be some required by
@@ -157,7 +233,8 @@ ShvVmxSetupVmcsForVp (
     //
     __vmx_vmwrite(CPU_BASED_VM_EXEC_CONTROL,
                            ShvUtilAdjustMsr(VpData->MsrData[14],
-                                            CPU_BASED_ACTIVATE_MSR_BITMAP | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS));
+                                            CPU_BASED_ACTIVATE_MSR_BITMAP |
+                                            CPU_BASED_ACTIVATE_SECONDARY_CONTROLS));
 
     //
     // If any interrupts were pending upon entering the hypervisor, acknowledge
@@ -165,7 +242,8 @@ ShvVmxSetupVmcsForVp (
     //
     __vmx_vmwrite(VM_EXIT_CONTROLS,
                            ShvUtilAdjustMsr(VpData->MsrData[15],
-                                            VM_EXIT_ACK_INTR_ON_EXIT | VM_EXIT_IA32E_MODE));
+                                            VM_EXIT_ACK_INTR_ON_EXIT |
+                                            VM_EXIT_IA32E_MODE));
 
     //
     // As we exit back into the guest, make sure to exist in x64 mode as well.
@@ -173,84 +251,84 @@ ShvVmxSetupVmcsForVp (
     __vmx_vmwrite(VM_ENTRY_CONTROLS,
                            ShvUtilAdjustMsr(VpData->MsrData[16],
                                             VM_ENTRY_IA32E_MODE));
- 
+
     //
     // Load the CS Segment (Ring 0 Code)
     //
-    ShvUtilConvertGdtEntry(state->SpecialRegisters.Gdtr.Base, state->ContextFrame.SegCs, &vmxGdtEntry);
+    ShvUtilConvertGdtEntry(state->Gdtr.Base, context->SegCs, &vmxGdtEntry);
     __vmx_vmwrite(GUEST_CS_SELECTOR, vmxGdtEntry.Selector);
     __vmx_vmwrite(GUEST_CS_LIMIT, vmxGdtEntry.Limit);
     __vmx_vmwrite(GUEST_CS_AR_BYTES, vmxGdtEntry.AccessRights);
     __vmx_vmwrite(GUEST_CS_BASE, vmxGdtEntry.Base);
-    __vmx_vmwrite(HOST_CS_SELECTOR, state->ContextFrame.SegCs & ~RPL_MASK);
- 
+    __vmx_vmwrite(HOST_CS_SELECTOR, context->SegCs & ~RPL_MASK);
+
     //
     // Load the SS Segment (Ring 0 Data)
     //
-    ShvUtilConvertGdtEntry(state->SpecialRegisters.Gdtr.Base, state->ContextFrame.SegSs, &vmxGdtEntry);
+    ShvUtilConvertGdtEntry(state->Gdtr.Base, context->SegSs, &vmxGdtEntry);
     __vmx_vmwrite(GUEST_SS_SELECTOR, vmxGdtEntry.Selector);
     __vmx_vmwrite(GUEST_SS_LIMIT, vmxGdtEntry.Limit);
     __vmx_vmwrite(GUEST_SS_AR_BYTES, vmxGdtEntry.AccessRights);
     __vmx_vmwrite(GUEST_SS_BASE, vmxGdtEntry.Base);
-    __vmx_vmwrite(HOST_SS_SELECTOR, state->ContextFrame.SegSs & ~RPL_MASK);
- 
+    __vmx_vmwrite(HOST_SS_SELECTOR, context->SegSs & ~RPL_MASK);
+
     //
     // Load the DS Segment (Ring 3 Data)
     //
-    ShvUtilConvertGdtEntry(state->SpecialRegisters.Gdtr.Base, state->ContextFrame.SegDs, &vmxGdtEntry);
+    ShvUtilConvertGdtEntry(state->Gdtr.Base, context->SegDs, &vmxGdtEntry);
     __vmx_vmwrite(GUEST_DS_SELECTOR, vmxGdtEntry.Selector);
     __vmx_vmwrite(GUEST_DS_LIMIT, vmxGdtEntry.Limit);
     __vmx_vmwrite(GUEST_DS_AR_BYTES, vmxGdtEntry.AccessRights);
     __vmx_vmwrite(GUEST_DS_BASE, vmxGdtEntry.Base);
-    __vmx_vmwrite(HOST_DS_SELECTOR, state->ContextFrame.SegDs & ~RPL_MASK);
+    __vmx_vmwrite(HOST_DS_SELECTOR, context->SegDs & ~RPL_MASK);
 
     //
     // Load the ES Segment (Ring 3 Data)
     //
-    ShvUtilConvertGdtEntry(state->SpecialRegisters.Gdtr.Base, state->ContextFrame.SegEs, &vmxGdtEntry);
+    ShvUtilConvertGdtEntry(state->Gdtr.Base, context->SegEs, &vmxGdtEntry);
     __vmx_vmwrite(GUEST_ES_SELECTOR, vmxGdtEntry.Selector);
     __vmx_vmwrite(GUEST_ES_LIMIT, vmxGdtEntry.Limit);
     __vmx_vmwrite(GUEST_ES_AR_BYTES, vmxGdtEntry.AccessRights);
     __vmx_vmwrite(GUEST_ES_BASE, vmxGdtEntry.Base);
-    __vmx_vmwrite(HOST_ES_SELECTOR, state->ContextFrame.SegEs & ~RPL_MASK);
- 
+    __vmx_vmwrite(HOST_ES_SELECTOR, context->SegEs & ~RPL_MASK);
+
     //
     // Load the FS Segment (Ring 3 Compatibility-Mode TEB)
     //
-    ShvUtilConvertGdtEntry(state->SpecialRegisters.Gdtr.Base, state->ContextFrame.SegFs, &vmxGdtEntry);
+    ShvUtilConvertGdtEntry(state->Gdtr.Base, context->SegFs, &vmxGdtEntry);
     __vmx_vmwrite(GUEST_FS_SELECTOR, vmxGdtEntry.Selector);
     __vmx_vmwrite(GUEST_FS_LIMIT, vmxGdtEntry.Limit);
     __vmx_vmwrite(GUEST_FS_AR_BYTES, vmxGdtEntry.AccessRights);
     __vmx_vmwrite(GUEST_FS_BASE, vmxGdtEntry.Base);
     __vmx_vmwrite(HOST_FS_BASE, vmxGdtEntry.Base);
-    __vmx_vmwrite(HOST_FS_SELECTOR, state->ContextFrame.SegFs & ~RPL_MASK);
- 
+    __vmx_vmwrite(HOST_FS_SELECTOR, context->SegFs & ~RPL_MASK);
+
     //
     // Load the GS Segment (Ring 3 Data if in Compatibility-Mode, MSR-based in Long Mode)
     //
-    ShvUtilConvertGdtEntry(state->SpecialRegisters.Gdtr.Base, state->ContextFrame.SegGs, &vmxGdtEntry);
+    ShvUtilConvertGdtEntry(state->Gdtr.Base, context->SegGs, &vmxGdtEntry);
     __vmx_vmwrite(GUEST_GS_SELECTOR, vmxGdtEntry.Selector);
     __vmx_vmwrite(GUEST_GS_LIMIT, vmxGdtEntry.Limit);
     __vmx_vmwrite(GUEST_GS_AR_BYTES, vmxGdtEntry.AccessRights);
-    __vmx_vmwrite(GUEST_GS_BASE, state->SpecialRegisters.MsrGsBase);
-    __vmx_vmwrite(HOST_GS_BASE, state->SpecialRegisters.MsrGsBase);
-    __vmx_vmwrite(HOST_GS_SELECTOR, state->ContextFrame.SegGs & ~RPL_MASK);
- 
+    __vmx_vmwrite(GUEST_GS_BASE, state->MsrGsBase);
+    __vmx_vmwrite(HOST_GS_BASE, state->MsrGsBase);
+    __vmx_vmwrite(HOST_GS_SELECTOR, context->SegGs & ~RPL_MASK);
+
     //
     // Load the Task Register (Ring 0 TSS)
     //
-    ShvUtilConvertGdtEntry(state->SpecialRegisters.Gdtr.Base, state->SpecialRegisters.Tr, &vmxGdtEntry);
+    ShvUtilConvertGdtEntry(state->Gdtr.Base, state->Tr, &vmxGdtEntry);
     __vmx_vmwrite(GUEST_TR_SELECTOR, vmxGdtEntry.Selector);
     __vmx_vmwrite(GUEST_TR_LIMIT, vmxGdtEntry.Limit);
     __vmx_vmwrite(GUEST_TR_AR_BYTES, vmxGdtEntry.AccessRights);
     __vmx_vmwrite(GUEST_TR_BASE, vmxGdtEntry.Base);
     __vmx_vmwrite(HOST_TR_BASE, vmxGdtEntry.Base);
-    __vmx_vmwrite(HOST_TR_SELECTOR, state->SpecialRegisters.Tr & ~RPL_MASK);
- 
+    __vmx_vmwrite(HOST_TR_SELECTOR, state->Tr & ~RPL_MASK);
+
     //
     // Load the Local Descriptor Table (Ring 0 LDT on Redstone)
     //
-    ShvUtilConvertGdtEntry(state->SpecialRegisters.Gdtr.Base, state->SpecialRegisters.Ldtr, &vmxGdtEntry);
+    ShvUtilConvertGdtEntry(state->Gdtr.Base, state->Ldtr, &vmxGdtEntry);
     __vmx_vmwrite(GUEST_LDTR_SELECTOR, vmxGdtEntry.Selector);
     __vmx_vmwrite(GUEST_LDTR_LIMIT, vmxGdtEntry.Limit);
     __vmx_vmwrite(GUEST_LDTR_AR_BYTES, vmxGdtEntry.AccessRights);
@@ -259,23 +337,23 @@ ShvVmxSetupVmcsForVp (
     //
     // Now load the GDT itself
     //
-    __vmx_vmwrite(GUEST_GDTR_BASE, (ULONG_PTR)state->SpecialRegisters.Gdtr.Base);
-    __vmx_vmwrite(GUEST_GDTR_LIMIT, state->SpecialRegisters.Gdtr.Limit);
-    __vmx_vmwrite(HOST_GDTR_BASE, (ULONG_PTR)state->SpecialRegisters.Gdtr.Base);
+    __vmx_vmwrite(GUEST_GDTR_BASE, (uintptr_t)state->Gdtr.Base);
+    __vmx_vmwrite(GUEST_GDTR_LIMIT, state->Gdtr.Limit);
+    __vmx_vmwrite(HOST_GDTR_BASE, (uintptr_t)state->Gdtr.Base);
 
     //
     // And then the IDT
     //
-    __vmx_vmwrite(GUEST_IDTR_BASE, (ULONG_PTR)state->SpecialRegisters.Idtr.Base);
-    __vmx_vmwrite(GUEST_IDTR_LIMIT, state->SpecialRegisters.Idtr.Limit);
-    __vmx_vmwrite(HOST_IDTR_BASE, (ULONG_PTR)state->SpecialRegisters.Idtr.Base);
+    __vmx_vmwrite(GUEST_IDTR_BASE, (uintptr_t)state->Idtr.Base);
+    __vmx_vmwrite(GUEST_IDTR_LIMIT, state->Idtr.Limit);
+    __vmx_vmwrite(HOST_IDTR_BASE, (uintptr_t)state->Idtr.Base);
 
     //
     // Load CR0
     //
-    __vmx_vmwrite(CR0_READ_SHADOW, state->SpecialRegisters.Cr0);
-    __vmx_vmwrite(HOST_CR0, state->SpecialRegisters.Cr0);
-    __vmx_vmwrite(GUEST_CR0, state->SpecialRegisters.Cr0);
+    __vmx_vmwrite(CR0_READ_SHADOW, state->Cr0);
+    __vmx_vmwrite(HOST_CR0, state->Cr0);
+    __vmx_vmwrite(GUEST_CR0, state->Cr0);
 
     //
     // Load CR3 -- do not use the current process' address space for the host,
@@ -283,47 +361,51 @@ ShvVmxSetupVmcsForVp (
     // as part of the DPC interrupt we execute in.
     //
     __vmx_vmwrite(HOST_CR3, VpData->SystemDirectoryTableBase);
-    __vmx_vmwrite(GUEST_CR3, state->SpecialRegisters.Cr3);
+    __vmx_vmwrite(GUEST_CR3, state->Cr3);
 
     //
     // Load CR4
     //
-    __vmx_vmwrite(HOST_CR4, state->SpecialRegisters.Cr4);
-    __vmx_vmwrite(GUEST_CR4, state->SpecialRegisters.Cr4);
-    __vmx_vmwrite(CR4_READ_SHADOW, state->SpecialRegisters.Cr4);
+    __vmx_vmwrite(HOST_CR4, state->Cr4);
+    __vmx_vmwrite(GUEST_CR4, state->Cr4);
+    __vmx_vmwrite(CR4_READ_SHADOW, state->Cr4);
 
     //
     // Load debug MSR and register (DR7)
     //
-    __vmx_vmwrite(GUEST_IA32_DEBUGCTL, state->SpecialRegisters.DebugControl);
-    __vmx_vmwrite(GUEST_DR7, state->SpecialRegisters.KernelDr7);
+    __vmx_vmwrite(GUEST_IA32_DEBUGCTL, state->DebugControl);
+    __vmx_vmwrite(GUEST_DR7, state->KernelDr7);
 
     //
     // Finally, load the guest stack, instruction pointer, and rflags, which
     // corresponds exactly to the location where RtlCaptureContext will return
     // to inside of ShvVpInitialize.
     //
-    __vmx_vmwrite(GUEST_RSP, state->ContextFrame.Rsp);
-    __vmx_vmwrite(GUEST_RIP, state->ContextFrame.Rip);
-    __vmx_vmwrite(GUEST_RFLAGS, state->ContextFrame.EFlags);
+    __vmx_vmwrite(GUEST_RSP, (uintptr_t)VpData->ShvStackLimit + KERNEL_STACK_SIZE - sizeof(CONTEXT));
+    __vmx_vmwrite(GUEST_RIP, (uintptr_t)ShvVpRestoreAfterLaunch);
+    __vmx_vmwrite(GUEST_RFLAGS, context->EFlags);
 
     //
     // Load the hypervisor entrypoint and stack. We give ourselves a standard
     // size kernel stack (24KB) and bias for the context structure that the
     // hypervisor entrypoint will push on the stack, avoiding the need for RSP
-    // modifying instructions in the entrypoint.
+    // modifying instructions in the entrypoint. Note that the CONTEXT pointer
+    // and thus the stack itself, must be 16-byte aligned for ABI compatibility
+    // with AMD64 -- specifically, XMM operations will fail otherwise, such as
+    // the ones that RtlCaptureContext will perform.
     //
-    __vmx_vmwrite(HOST_RSP, (ULONG_PTR)VpData->ShvStackLimit + KERNEL_STACK_SIZE - sizeof(CONTEXT));
-    __vmx_vmwrite(HOST_RIP, (ULONG_PTR)ShvVmxEntry);
+    C_ASSERT((KERNEL_STACK_SIZE - sizeof(CONTEXT)) % 16 == 0);
+    __vmx_vmwrite(HOST_RSP, (uintptr_t)VpData->ShvStackLimit + KERNEL_STACK_SIZE - sizeof(CONTEXT));
+    __vmx_vmwrite(HOST_RIP, (uintptr_t)ShvVmxEntry);
 }
 
-BOOLEAN
+UINT8
 ShvVmxProbe (
     VOID
     )
 {
-    INT cpu_info[4];
-    ULONGLONG featureControl;
+    INT32 cpu_info[4];
+    UINT64 featureControl;
 
     //
     // Check the Hypervisor Present-bit
@@ -360,49 +442,47 @@ ShvVmxProbe (
     return TRUE;
 }
 
-VOID
+INT32
 ShvVmxLaunchOnVp (
     _In_ PSHV_VP_DATA VpData
     )
 {
-    ULONG i;
+    UINT32 i;
 
     //
     // Initialize all the VMX-related MSRs by reading their value
     //
-    for (i = 0; i < RTL_NUMBER_OF(VpData->MsrData); i++)
+    for (i = 0; i < sizeof(VpData->MsrData) / sizeof(VpData->MsrData[0]); i++)
     {
         VpData->MsrData[i].QuadPart = __readmsr(MSR_IA32_VMX_BASIC + i);
     }
 
     //
+    // Initialize the EPT structures
+    //
+    ShvVmxEptInitialize(VpData);
+
+    //
     // Attempt to enter VMX root mode on this processor.
     //
-    if (ShvVmxEnterRootModeOnVp(VpData))
+    if (ShvVmxEnterRootModeOnVp(VpData) == FALSE)
     {
         //
-        // Initialize the VMCS, both guest and host state.
+        // We could not enter VMX Root mode
         //
-        ShvVmxSetupVmcsForVp(VpData);
-        
-        //
-        // Record that VMX is now enabled
-        //
-        VpData->VmxEnabled = 1;
-
-        //
-        // Launch the VMCS, based on the guest data that was loaded into the
-        // various VMCS fields by ShvVmxSetupVmcsForVp. This will cause the
-        // processor to jump to the return address of RtlCaptureContext in
-        // ShvVpInitialize, which called us.
-        //
-        __vmx_vmlaunch();
-
-        //
-        // If we got here, either VMCS setup failed in some way, or the launch
-        // did not proceed as planned. Because VmxEnabled is not set to 1, this
-        // will correctly register as a failure.
-        //
-        __vmx_off();
+        return SHV_STATUS_NOT_AVAILABLE;
     }
+
+    //
+    // Initialize the VMCS, both guest and host state.
+    //
+    ShvVmxSetupVmcsForVp(VpData);
+
+    //
+    // Launch the VMCS, based on the guest data that was loaded into the
+    // various VMCS fields by ShvVmxSetupVmcsForVp. This will cause the
+    // processor to jump to ShvVpRestoreAfterLaunch on success, or return
+    // back to the caller on failure.
+    //
+    return ShvVmxLaunch();
 }

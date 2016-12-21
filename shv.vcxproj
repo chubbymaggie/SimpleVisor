@@ -15,6 +15,7 @@
     <Platform Condition="'$(Platform)' == ''">Win32</Platform>
     <RootNamespace>HyperPlatform</RootNamespace>
     <ProjectName>SimpleVisor</ProjectName>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
@@ -26,6 +27,9 @@
     <DriverTargetPlatform>Desktop</DriverTargetPlatform>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <EnableInf2cat>false</EnableInf2cat>
+  </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <Optimization>Full</Optimization>
@@ -40,12 +44,12 @@
     <Link />
     <Link>
       <AdditionalDependencies>$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib</AdditionalDependencies>
-      <EntryPointSymbol>ShvInitialize</EntryPointSymbol>
+      <EntryPointSymbol>DriverEntry</EntryPointSymbol>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
       <Profile>false</Profile>
       <MergeSections>_TEXT=.text;_PAGE=PAGE</MergeSections>
       <AdditionalOptions>/ALIGN:0x10 %(AdditionalOptions)</AdditionalOptions>
-      <GenerateDebugInformation>No</GenerateDebugInformation>
+      <GenerateDebugInformation>Debug</GenerateDebugInformation>
       <ProfileGuidedDatabase />
       <Driver>NotSet</Driver>
     </Link>
@@ -56,14 +60,23 @@
     <ClCompile Include="shvvmx.c" />
     <ClCompile Include="shvvmxhv.c" />
     <ClCompile Include="shvvp.c" />
+    <ClCompile Include="nt\shvos.c" />
+    <ClCompile Include="uefi\shvos.c">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="shv.h" />
     <ClInclude Include="ntint.h" />
+    <ClInclude Include="shv_x.h" />
     <ClInclude Include="vmx.h" />
   </ItemGroup>
   <ItemGroup>
-    <MASM Include="shvx64.asm" />
+    <MASM Include="shvvmxhvx64.asm" />
+    <MASM Include="nt\shvosx64.asm" />
+    <MASM Include="uefi\shvosx64.asm">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </MASM>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

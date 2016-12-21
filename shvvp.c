@@ -22,204 +22,183 @@ Environment:
 
 #include "shv.h"
 
+UINT8
+ShvIsOurHypervisorPresent (
+    VOID
+    )
+{
+    INT32 cpuInfo[4];
+
+    //
+    // Check if ECX[31h] ("Hypervisor Present Bit") is set in CPUID 1h
+    //
+    __cpuid(cpuInfo, 1);
+    if (cpuInfo[2] & HYPERV_HYPERVISOR_PRESENT_BIT)
+    {
+        //
+        // Next, check if this is a compatible Hypervisor, and if it has the
+        // SimpleVisor signature
+        //
+        __cpuid(cpuInfo, HYPERV_CPUID_INTERFACE);
+        if (cpuInfo[0] == ' vhS')
+        {
+            //
+            // It's us!
+            //
+            return TRUE;
+        }
+    }
+
+    //
+    // No Hypervisor, or someone else's
+    //
+    return FALSE;
+}
+
 VOID
-ShvVpInitialize (
-    _In_ PSHV_VP_DATA Data,
-    _In_ ULONG64 SystemDirectoryTableBase
+ShvCaptureSpecialRegisters (
+    _In_ PSHV_SPECIAL_REGISTERS SpecialRegisters
     )
 {
     //
-    // Store the hibernation state of the processor, which contains all the
-    // special registers and MSRs which are what the VMCS will need as part
-    // of its setup. This avoids using assembly sequences and manually reading
-    // this data.
+    // Use compiler intrinsics to get the data we need
     //
-    KeSaveStateForHibernate(&Data->HostState);
+    SpecialRegisters->Cr0 = __readcr0();
+    SpecialRegisters->Cr3 = __readcr3();
+    SpecialRegisters->Cr4 = __readcr4();
+    SpecialRegisters->DebugControl = __readmsr(MSR_DEBUG_CTL);
+    SpecialRegisters->MsrGsBase = __readmsr(MSR_GS_BASE);
+    SpecialRegisters->KernelDr7 = __readdr(7);
+    _sgdt(&SpecialRegisters->Gdtr.Limit);
+    __sidt(&SpecialRegisters->Idtr.Limit);
+
+    //
+    // Use OS-specific functions to get these two
+    //
+    _str(&SpecialRegisters->Tr);
+    _sldt(&SpecialRegisters->Ldtr);
+}
+
+DECLSPEC_NORETURN
+VOID
+ShvVpRestoreAfterLaunch (
+    VOID
+    )
+{
+    PSHV_VP_DATA vpData;
+
+    //
+    // Get the per-processor data. This routine temporarily executes on the
+    // same stack as the hypervisor (using no real stack space except the home
+    // registers), so we can retrieve the VP the same way the hypervisor does.
+    //
+    vpData = (PSHV_VP_DATA)((uintptr_t)_AddressOfReturnAddress() +
+                            sizeof(CONTEXT) -
+                            KERNEL_STACK_SIZE);
+
+    //
+    // Record that VMX is now enabled by returning back to ShvVpInitialize with
+    // the Alignment Check (AC) bit set.
+    //
+    vpData->ContextFrame.EFlags |= EFLAGS_ALIGN_CHECK;
+
+    //
+    // And finally, restore the context, so that all register and stack
+    // state is finally restored.
+    //
+    ShvOsRestoreContext(&vpData->ContextFrame);
+}
+
+INT32
+ShvVpInitialize (
+    _In_ PSHV_VP_DATA Data
+    )
+{
+    INT32 status;
+
+    //
+    // Prepare any OS-specific CPU data
+    //
+    status = ShvOsPrepareProcessor(Data);
+    if (status != SHV_STATUS_SUCCESS)
+    {
+        return status;
+    }
+
+    // Read the special control registers for this processor
+    // Note: KeSaveStateForHibernate(&Data->HostState) can be used as a Windows
+    // specific undocumented function that can also get this data.
+    //
+    ShvCaptureSpecialRegisters(&Data->SpecialRegisters);
 
     //
     // Then, capture the entire register state. We will need this, as once we
     // launch the VM, it will begin execution at the defined guest instruction
-    // pointer, which is being captured as part of this call. In other words,
-    // we will return right where we were, but with all our registers corrupted
-    // by the VMCS/VMX initialization code (as guest state does not include
-    // register state). By saving the context here, which includes all general
-    // purpose registers, we guarantee that we return with all of our starting
-    // register values as well!
+    // pointer, which we set to ShvVpRestoreAfterLaunch, with the registers set
+    // to whatever value they were deep inside the VMCS/VMX inialization code.
+    // By using RtlRestoreContext, that function sets the AC flag in EFLAGS and
+    // returns here with our registers restored.
     //
-    RtlCaptureContext(&Data->HostState.ContextFrame);
-
-    //
-    // As per the above, we might be here because the VM has actually launched.
-    // We can check this by verifying the value of the VmxEnabled field, which
-    // is set to 1 right before VMXLAUNCH is performed. We do not use the Data
-    // parameter or any other local register in this function, and in fact have
-    // defined VmxEnabled as volatile, because as per the above, our register
-    // state is currently dirty due to the VMCALL itself. By using the global
-    // variable combined with an API call, we also make sure that the compiler
-    // will not optimize this access in any way, even on LTGC/Ox builds.
-    //
-    if (ShvGlobalData->VpData[KeGetCurrentProcessorNumberEx(NULL)].VmxEnabled == 1)
+    ShvOsCaptureContext(&Data->ContextFrame);
+    if ((__readeflags() & EFLAGS_ALIGN_CHECK) == 0)
     {
         //
-        // We now indicate that the VM has launched, and that we are about to
-        // restore the GPRs back to their original values. This will have the
-        // effect of putting us yet *AGAIN* at the previous line of code, but
-        // this time the value of VmxEnabled will be two, bypassing the if and
-        // else if checks.
+        // If the AC bit is not set in EFLAGS, it means that we have not yet
+        // launched the VM. Attempt to initialize VMX on this processor.
         //
-        ShvGlobalData->VpData[KeGetCurrentProcessorNumberEx(NULL)].VmxEnabled = 2;
-
-        //
-        // And finally, restore the context, so that all register and stack
-        // state is finally restored. Note that by continuing to reference the
-        // per-VP data this way, the compiler will continue to generate non-
-        // optimized accesses, guaranteeing that no previous register state
-        // will be used.
-        //
-        RtlRestoreContext(&ShvGlobalData->VpData[KeGetCurrentProcessorNumberEx(NULL)].HostState.ContextFrame, NULL);
+        status = ShvVmxLaunchOnVp(Data);
     }
-    //
-    // If we are in this branch comparison, it means that we have not yet
-    // attempted to launch the VM, nor that we have launched it. In other
-    // words, this is the first time in ShvVpInitialize. Because of this,
-    // we are free to use all register state, as it is ours to use.
-    //
-    else if (Data->VmxEnabled == 0)
-    {
-        //
-        // First, capture the value of the PML4 for the SYSTEM process, so that
-        // all virtual processors, regardless of which process the current LP
-        // has interrupted, can share the correct kernel address space.
-        //
-        Data->SystemDirectoryTableBase = SystemDirectoryTableBase;
 
-        //
-        // Then, attempt to initialize VMX on this processor
-        //
-        ShvVmxLaunchOnVp(Data);
-    }
+    //
+    // If we got here, the hypervisor is running :-)
+    //
+    return SHV_STATUS_SUCCESS;
 }
 
 VOID
-ShvVpUninitialize (
-    _In_ PSHV_VP_DATA VpData
+ShvVpUnloadCallback (
+    _In_ PSHV_CALLBACK_CONTEXT Context
     )
 {
-    INT dummy[4];
-    UNREFERENCED_PARAMETER(VpData);
-
-    //
-    // Send the magic shutdown instruction sequence
-    //
-    __cpuidex(dummy, 0x41414141, 0x42424242);
-
-    //
-    // The processor will return here after the hypervisor issues a VMXOFF
-    // instruction and restores the CPU context to this location. Unfortunately
-    // because this is done with RtlRestoreContext which returns using "iretq",
-    // this causes the processor to remove the RPL bits off the segments. As
-    // the x64 kernel does not expect kernel-mode code to chang ethe value of
-    // any segments, this results in the DS and ES segments being stuck 0x20,
-    // and the FS segment being stuck at 0x50, until the next context switch.
-    //
-    // If the DPC happened to have interrupted either the idle thread or system
-    // thread, that's perfectly fine (albeit unusual). If the DPC interrupted a
-    // 64-bit long-mode thread, that's also fine. However if the DPC interrupts
-    // a thread in compatibility-mode, running as part of WoW64, it will hit a
-    // GPF instantenously and crash.
-    //
-    // Thus, set the segments to their correct value, one more time, as a fix.
-    //
-    ShvVmxCleanup(KGDT64_R3_DATA | RPL_MASK, KGDT64_R3_CMTEB | RPL_MASK);
-}
-
-VOID
-ShvVpCallbackDpc (
-    _In_ PRKDPC Dpc,
-    _In_opt_ PVOID Context,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2
-    )
-{
+    INT32 cpuInfo[4];
     PSHV_VP_DATA vpData;
-    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(Context);
 
     //
-    // Get the per-VP data for this logical processor
+    // Send the magic shutdown instruction sequence. It will return in EAX:EBX
+    // the VP data for the current CPU, which we must free.
     //
-    vpData = &ShvGlobalData->VpData[KeGetCurrentProcessorNumberEx(NULL)];
+    cpuInfo[0] = cpuInfo[1] = 0;
+    __cpuidex(cpuInfo, 0x41414141, 0x42424242);
 
     //
-    // Check if we are loading, or unloading
+    // If SimpleVisor is disabled for some reason, CPUID won't return anything
+    // so don't free any memory. It will unfortunately end up leaked.
     //
-    if (ARGUMENT_PRESENT(Context))
+    vpData = (PSHV_VP_DATA)((UINT64)cpuInfo[0] << 32 | (UINT32)cpuInfo[1]);
+    if (vpData != NULL)
     {
-        //
-        // Initialize the virtual processor
-        //
-        ShvVpInitialize(vpData, (ULONG64)Context);
+        ShvOsFreeContiguousAlignedMemory(vpData, sizeof(*vpData));
     }
-    else
-    {
-        //
-        // Tear down the virtual processor
-        //
-        ShvVpUninitialize(vpData);
-    }
-
-    //
-    // Wait for all DPCs to synchronize at this point
-    //
-    KeSignalCallDpcSynchronize(SystemArgument2);
-
-    //
-    // Mark the DPC as being complete
-    //
-    KeSignalCallDpcDone(SystemArgument1);
 }
 
-PSHV_GLOBAL_DATA
-ShvVpAllocateGlobalData (
-    VOID
+PSHV_VP_DATA
+ShvVpAllocateData (
+    _In_ UINT32 CpuCount
     )
 {
-    PHYSICAL_ADDRESS lowest, highest;
-    PSHV_GLOBAL_DATA data;
-    ULONG cpuCount, size;
+    PSHV_VP_DATA data;
 
     //
-    // The entire address range is OK for this allocation
+    // Allocate a contiguous chunk of RAM to back this allocation
     //
-    lowest.QuadPart = 0;
-    highest.QuadPart = lowest.QuadPart - 1;
-
-    //
-    // Query the number of logical processors, including those potentially in
-    // groups other than 0. This allows us to support >64 processors.
-    //
-    cpuCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-
-    //
-    // Each processor will receive its own slice of per-virtual processor data.
-    //
-    size = FIELD_OFFSET(SHV_GLOBAL_DATA, VpData) + cpuCount * sizeof(SHV_VP_DATA);
-
-    //
-    // Allocate a contiguous chunk of RAM to back this allocation and make sure
-    // that it is RW only, instead of RWX, by using the new Windows 8 API.
-    //
-    data = (PSHV_GLOBAL_DATA)MmAllocateContiguousNodeMemory(size,
-                                                            lowest,
-                                                            highest,
-                                                            lowest,
-                                                            PAGE_READWRITE,
-                                                            MM_ANY_NODE_OK);
+    data = ShvOsAllocateContigousAlignedMemory(sizeof(*data) * CpuCount);
     if (data != NULL)
     {
         //
         // Zero out the entire data region
         //
-        __stosq((PULONGLONG)data, 0, size / sizeof(ULONGLONG));
+        __stosq((UINT64*)data, 0, (sizeof(*data) / sizeof(UINT64)) * CpuCount);
     }
 
     //
@@ -228,3 +207,95 @@ ShvVpAllocateGlobalData (
     return data;
 }
 
+VOID
+ShvVpFreeData (
+    _In_ PSHV_VP_DATA Data,
+    _In_ UINT32 CpuCount
+    )
+{
+    //
+    // Free the contiguous chunk of RAM
+    //
+    ShvOsFreeContiguousAlignedMemory(Data, sizeof(*Data) * CpuCount);
+}
+
+VOID
+ShvVpLoadCallback (
+    _In_ PSHV_CALLBACK_CONTEXT Context
+    )
+{
+    PSHV_VP_DATA vpData;
+    INT32 status;
+
+    vpData = NULL;
+    
+    //
+    // Detect if the hardware appears to support VMX root mode to start.
+    // No attempts are made to enable this if it is lacking or disabled.
+    //
+    if (!ShvVmxProbe())
+    {
+        status = SHV_STATUS_NOT_AVAILABLE;
+        goto Failure;
+    }
+
+    //
+    // Allocate the per-VP data for this logical processor
+    //
+    vpData = ShvVpAllocateData(1);
+    if (vpData == NULL)
+    {
+        status = SHV_STATUS_NO_RESOURCES;
+        goto Failure;
+    }
+
+    //
+    // First, capture the value of the PML4 for the SYSTEM process, so that all
+    // virtual processors, regardless of which process the current LP has
+    // interrupted, can share the correct kernel address space.
+    //
+    vpData->SystemDirectoryTableBase = Context->Cr3;
+
+    //
+    // Initialize the virtual processor
+    //
+    status = ShvVpInitialize(vpData);
+    if (status != SHV_STATUS_SUCCESS)
+    {
+        //
+        // Bail out, free the allocated per-processor data
+        //
+        goto Failure;
+    }
+
+    //
+    // Our hypervisor should now be seen as present on this LP, as the SHV
+    // correctly handles CPUID ECX features register.
+    //
+    if (ShvIsOurHypervisorPresent() == FALSE)
+    {
+        //
+        // Free the per-processor data
+        //
+        status = SHV_STATUS_NOT_PRESENT;
+        goto Failure;
+    }
+
+    //
+    // This CPU is hyperjacked!
+    //
+    _InterlockedIncrement((volatile long*)&Context->InitCount);
+    return;
+
+Failure:
+    //
+    // Return failure
+    //
+    if (vpData != NULL)
+    {
+        ShvVpFreeData(vpData, 1);
+    }
+    Context->FailedCpu = ShvOsGetCurrentProcessorNumber();
+    Context->FailureStatus = status;
+    return;
+}

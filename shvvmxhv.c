@@ -16,7 +16,7 @@ Author:
 
 Environment:
 
-    Hypervisor mode only, IRQL DIRQL_MAX
+    Hypervisor mode only, IRQL MAX_IRQL
 
 --*/
 
@@ -38,13 +38,13 @@ ShvVmxResume (
     __vmx_vmresume();
 }
 
-ULONG_PTR
+uintptr_t
 FORCEINLINE
 ShvVmxRead (
-    _In_ ULONG VmcsFieldId
+    _In_ UINT32 VmcsFieldId
     )
 {
-    SIZE_T FieldData;
+    size_t FieldData;
 
     //
     // Because VMXREAD returns an error code, and not the data, it is painful
@@ -52,6 +52,31 @@ ShvVmxRead (
     //
     __vmx_vmread(VmcsFieldId, &FieldData);
     return FieldData;
+}
+
+INT32
+ShvVmxLaunch (
+    VOID
+    )
+{
+    INT32 failureCode;
+
+    //
+    // Launch the VMCS
+    //
+    __vmx_vmlaunch();
+
+    //
+    // If we got here, either VMCS setup failed in some way, or the launch
+    // did not proceed as planned.
+    //
+    failureCode = (INT32)ShvVmxRead(VM_INSTRUCTION_ERROR);
+    __vmx_off();
+
+    //
+    // Return the error back to the caller
+    //
+    return failureCode;
 }
 
 VOID
@@ -74,7 +99,7 @@ ShvVmxHandleCpuid (
     _In_ PSHV_VP_STATE VpState
     )
 {
-    INT cpu_info[4];
+    INT32 cpu_info[4];
 
     //
     // Check for the magic CPUID sequence, and check that it is is coming from
@@ -94,7 +119,7 @@ ShvVmxHandleCpuid (
     // Otherwise, issue the CPUID to the logical processor based on the indexes
     // on the VP's GPRs.
     //
-    __cpuidex(cpu_info, (INT)VpState->VpRegs->Rax, (INT)VpState->VpRegs->Rcx);
+    __cpuidex(cpu_info, (INT32)VpState->VpRegs->Rax, (INT32)VpState->VpRegs->Rcx);
 
     //
     // Check if this was CPUID 1h, which is the features request.
@@ -105,7 +130,14 @@ ShvVmxHandleCpuid (
         // Set the Hypervisor Present-bit in RCX, which Intel and AMD have both
         // reserved for this indication.
         //
-        cpu_info[2] |= 0x80000000;
+        cpu_info[2] |= HYPERV_HYPERVISOR_PRESENT_BIT;
+    }
+    else if (VpState->VpRegs->Rax == HYPERV_CPUID_INTERFACE)
+    {
+        //
+        // Return our interface identifier
+        //
+        cpu_info[0] = ' vhS';
     }
 
     //
@@ -125,7 +157,8 @@ ShvVmxHandleXsetbv (
     //
     // Simply issue the XSETBV instruction on the native logical processor.
     //
-    _xsetbv((ULONG)VpState->VpRegs->Rcx,
+
+    _xsetbv((UINT32)VpState->VpRegs->Rcx,
             VpState->VpRegs->Rdx << 32 |
             VpState->VpRegs->Rax);
 }
@@ -182,7 +215,6 @@ ShvVmxHandleExit (
         ShvVmxHandleVmx(VpState);
         break;
     default:
-        NT_ASSERT(FALSE);
         break;
     }
 
@@ -196,7 +228,6 @@ ShvVmxHandleExit (
 }
 
 DECLSPEC_NORETURN
-EXTERN_C
 VOID
 ShvVmxEntryHandler (
     _In_ PCONTEXT Context
@@ -206,25 +237,16 @@ ShvVmxEntryHandler (
     PSHV_VP_DATA vpData;
 
     //
-    // For performance and sanity reasons, do not allow any hardware interrupts
-    // to come in while we are inside of the hypervisor context. We still want
-    // the clock and IPIs to occur, though. Obviously don't allow any thread
-    // scheduling, DPCs, timers or APCs to interrupt us either. This means that
-    // we should spend very little time in the hypervisor (always a good thing)
-    //
-    KeRaiseIrql(CLOCK_LEVEL - 1, &guestContext.GuestIrql);
-
-    //
-    // Because we had to use RCX when calling RtlCaptureContext, its true value
+    // Because we had to use RCX when calling ShvOsCaptureContext, its value
     // was actually pushed on the stack right before the call. Go dig into the
     // stack to find it, and overwrite the bogus value that's there now.
     //
-    Context->Rcx = *(PULONG64)((ULONG_PTR)Context - sizeof(Context->Rcx));
+    Context->Rcx = *(UINT64*)((uintptr_t)Context - sizeof(Context->Rcx));
 
     //
     // Get the per-VP data for this processor.
     //
-    vpData = &ShvGlobalData->VpData[KeGetCurrentProcessorNumberEx(NULL)];
+    vpData = (VOID*)((uintptr_t)(Context + 1) - KERNEL_STACK_SIZE);
 
     //
     // Build a little stack context to make it easier to keep track of certain
@@ -251,19 +273,20 @@ ShvVmxEntryHandler (
     if (guestContext.ExitVm)
     {
         //
-        // When running in VMX root mode, the processor will set limits of the
-        // GDT and IDT to 0xFFFF (notice that there are no Host VMCS fields to
-        // set these values). This causes problems with PatchGuard, which will
-        // believe that the GDTR and IDTR have been modified by malware, and
-        // eventually crash the system. Since we know what the original state
-        // of the GDTR and IDTR was, simply restore it now.
+        // Return the VP Data structure in RAX:RBX which is going to be part of
+        // the CPUID response that the caller (ShvVpUninitialize) expects back.
         //
-        __lgdt(&vpData->HostState.SpecialRegisters.Gdtr.Limit);
-        __lidt(&vpData->HostState.SpecialRegisters.Idtr.Limit);
+        Context->Rax = (uintptr_t)vpData >> 32;
+        Context->Rbx = (uintptr_t)vpData & 0xFFFFFFFF;
 
         //
-        // Our DPC routine may have interrupted an arbitrary user process, and
-        // not an idle or system thread as usually happens on an idle system.
+        // Perform any OS-specific CPU uninitialization work
+        //
+        ShvOsUnprepareProcessor(vpData);
+
+        //
+        // Our callback routine may have interrupted an arbitrary user process,
+        // and therefore not a thread running with a systemwide page directory.
         // Therefore if we return back to the original caller after turning off
         // VMX, it will keep our current "host" CR3 value which we set on entry
         // to the PML4 of the SYSTEM process. We want to return back with the
@@ -273,12 +296,14 @@ ShvVmxEntryHandler (
         __writecr3(ShvVmxRead(GUEST_CR3));
 
         //
-        // Finally, set the stack and instruction pointer to whatever location
-        // had the instruction causing our VM-Exit, such as ShvVpUninitialize.
-        // This will effectively act as a longjmp back to that location.
+        // Finally, restore the stack, instruction pointer and EFLAGS to the
+        // original values present when the instruction causing our VM-Exit
+        // execute (such as ShvVpUninitialize). This will effectively act as
+        // a longjmp back to that location.
         //
         Context->Rsp = guestContext.GuestRsp;
-        Context->Rip = (ULONG64)guestContext.GuestRip;
+        Context->Rip = (UINT64)guestContext.GuestRip;
+        Context->EFlags = (UINT32)guestContext.GuestEFlags;
 
         //
         // Turn off VMX root mode on this logical processor. We're done here.
@@ -302,13 +327,8 @@ ShvVmxEntryHandler (
         // needed as RtlRestoreContext will fix all the GPRs, and what we just
         // did to RSP will take care of the rest.
         //
-        Context->Rip = (ULONG64)ShvVmxResume;
+        Context->Rip = (UINT64)ShvVmxResume;
     }
-
-    //
-    // Restore the IRQL back to the original level
-    //
-    KeLowerIrql(guestContext.GuestIrql);
 
     //
     // Restore the context to either ShvVmxResume, in which case the CPU's VMX
@@ -317,6 +337,6 @@ ShvVmxEntryHandler (
     // which we use in case an exit was requested. In this case VMX must now be
     // off, and this will look like a longjmp to the original stack and RIP.
     //
-    RtlRestoreContext(Context, NULL);
+    ShvOsRestoreContext(Context);
 }
 

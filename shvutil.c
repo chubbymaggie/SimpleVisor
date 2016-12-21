@@ -24,20 +24,30 @@ Environment:
 
 VOID
 ShvUtilConvertGdtEntry (
-    _In_ PVOID GdtBase,
-    _In_ USHORT Selector,
+    _In_ VOID* GdtBase,
+    _In_ UINT16 Selector,
     _Out_ PVMX_GDTENTRY64 VmxGdtEntry
     )
 {
     PKGDTENTRY64 gdtEntry;
 
     //
-    // Read the GDT entry at the given selector, masking out the RPL bits. x64
-    // Windows does not use an LDT for these selectors in kernel, so the TI bit
-    // should never be set.
+    // Reject LDT or NULL entries
     //
-    NT_ASSERT((Selector & SELECTOR_TABLE_INDEX) == 0);
-    gdtEntry = (PKGDTENTRY64)((ULONG_PTR)GdtBase + (Selector & ~RPL_MASK));
+    if ((Selector == 0) ||
+        (Selector & SELECTOR_TABLE_INDEX) != 0)
+    {
+        VmxGdtEntry->Limit = VmxGdtEntry->AccessRights = 0;
+        VmxGdtEntry->Base = 0;
+        VmxGdtEntry->Selector = 0;
+        VmxGdtEntry->Bits.Unusable = TRUE;
+        return;
+    }
+
+    //
+    // Read the GDT entry at the given selector, masking out the RPL bits.
+    //
+    gdtEntry = (PKGDTENTRY64)((uintptr_t)GdtBase + (Selector & ~RPL_MASK));
 
     //
     // Write the selector directly 
@@ -60,9 +70,9 @@ ShvUtilConvertGdtEntry (
     //
     VmxGdtEntry->Base = ((gdtEntry->Bytes.BaseHigh << 24) |
                          (gdtEntry->Bytes.BaseMiddle << 16) |
-                         (gdtEntry->BaseLow)) & MAXULONG;
+                         (gdtEntry->BaseLow)) & 0xFFFFFFFF;
     VmxGdtEntry->Base |= ((gdtEntry->Bits.Type & 0x10) == 0) ?
-                         ((ULONG_PTR)gdtEntry->BaseUpper << 32) : 0;
+                         ((uintptr_t)gdtEntry->BaseUpper << 32) : 0;
 
     //
     // Load the access rights
@@ -78,10 +88,10 @@ ShvUtilConvertGdtEntry (
     VmxGdtEntry->Bits.Unusable = !gdtEntry->Bits.Present;
 }
 
-ULONG
+UINT32
 ShvUtilAdjustMsr (
     _In_ LARGE_INTEGER ControlValue,
-    _In_ ULONG DesiredValue
+    _In_ UINT32 DesiredValue
     )
 {
     //

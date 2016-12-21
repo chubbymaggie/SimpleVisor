@@ -21,6 +21,81 @@ Environment:
 --*/
 
 #pragma once
+#pragma warning(disable:4201)
+#pragma warning(disable:4214)
+
+#define DPL_USER                3
+#define DPL_SYSTEM              0
+#define MSR_GS_BASE             0xC0000101
+#define MSR_DEBUG_CTL           0x1D9
+#define RPL_MASK                3
+#define SELECTOR_TABLE_INDEX    0x04
+#define MTRR_TYPE_WB            6
+#define EFLAGS_ALIGN_CHECK      0x40000
+#define AMD64_TSS               9
+#ifndef PAGE_SIZE
+#define PAGE_SIZE               4096
+#endif
+
+typedef struct _KDESCRIPTOR
+{
+    UINT16 Pad[3];
+    UINT16 Limit;
+    void* Base;
+} KDESCRIPTOR, *PKDESCRIPTOR;
+
+typedef union _KGDTENTRY64
+{
+    struct
+    {
+        UINT16 LimitLow;
+        UINT16 BaseLow;
+        union
+        {
+            struct
+            {
+                UINT8 BaseMiddle;
+                UINT8 Flags1;
+                UINT8 Flags2;
+                UINT8 BaseHigh;
+            } Bytes;
+            struct
+            {
+                UINT32 BaseMiddle : 8;
+                UINT32 Type : 5;
+                UINT32 Dpl : 2;
+                UINT32 Present : 1;
+                UINT32 LimitHigh : 4;
+                UINT32 System : 1;
+                UINT32 LongMode : 1;
+                UINT32 DefaultBig : 1;
+                UINT32 Granularity : 1;
+                UINT32 BaseHigh : 8;
+            } Bits;
+        };
+        UINT32 BaseUpper;
+        UINT32 MustBeZero;
+    };
+    struct
+    {
+        INT64 DataLow;
+        INT64 DataHigh;
+    };
+} KGDTENTRY64, *PKGDTENTRY64;
+
+#pragma pack(push,4)
+typedef struct _KTSS64
+{
+    UINT32 Reserved0;
+    UINT64 Rsp0;
+    UINT64 Rsp1;
+    UINT64 Rsp2;
+    UINT64 Ist[8];
+    UINT64 Reserved1;
+    UINT16 Reserved2;
+    UINT16 IoMapBase;
+} KTSS64, *PKTSS64;
+#pragma pack(pop)
 
 #define CPU_BASED_VIRTUAL_INTR_PENDING          0x00000004
 #define CPU_BASED_USE_TSC_OFFSETING             0x00000008
@@ -97,6 +172,17 @@ Environment:
 #define VMX_BASIC_INS_OUT_INFO                  (1ULL << 54)
 #define VMX_BASIC_DEFAULT1_ZERO                 (1ULL << 55)
 
+#define VMX_EPT_EXECUTE_ONLY_BIT                (1ULL)
+#define VMX_EPT_PAGE_WALK_4_BIT                 (1ULL << 6)
+#define VMX_EPTP_UC_BIT                         (1ULL << 8)
+#define VMX_EPTP_WB_BIT                         (1ULL << 14)
+#define VMX_EPT_2MB_PAGE_BIT                    (1ULL << 16)
+#define VMX_EPT_1GB_PAGE_BIT                    (1ULL << 17)
+#define VMX_EPT_INVEPT_BIT                      (1ULL << 20)
+#define VMX_EPT_AD_BIT                          (1ULL << 21)
+#define VMX_EPT_EXTENT_CONTEXT_BIT              (1ULL << 25)
+#define VMX_EPT_EXTENT_GLOBAL_BIT               (1ULL << 26)
+
 /* MSRs & bits used for VMX enabling */
 #define MSR_IA32_VMX_BASIC                      0x480
 #define MSR_IA32_VMX_PINBASED_CTLS              0x481
@@ -121,6 +207,17 @@ Environment:
 #define IA32_FEATURE_CONTROL_MSR_ENABLE_VMXON_OUTSIDE_SMX 0x0004
 #define IA32_FEATURE_CONTROL_MSR_SENTER_PARAM_CTL         0x7f00
 #define IA32_FEATURE_CONTROL_MSR_ENABLE_SENTER            0x8000
+
+#define HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS   0x40000000
+#define HYPERV_CPUID_INTERFACE                  0x40000001
+#define HYPERV_CPUID_VERSION                    0x40000002
+#define HYPERV_CPUID_FEATURES                   0x40000003
+#define HYPERV_CPUID_ENLIGHTMENT_INFO           0x40000004
+#define HYPERV_CPUID_IMPLEMENT_LIMITS           0x40000005
+
+#define HYPERV_HYPERVISOR_PRESENT_BIT           0x80000000
+#define HYPERV_CPUID_MIN                        0x40000005
+#define HYPERV_CPUID_MAX                        0x4000ffff
 
 enum vmcs_field {
     VIRTUAL_PROCESSOR_ID            = 0x00000000,
@@ -328,4 +425,114 @@ enum vmcs_field {
 
 #define GUEST_ACTIVITY_ACTIVE           0
 #define GUEST_ACTIVITY_HLT              1
+
+typedef struct _VMX_GDTENTRY64
+{
+    UINT64 Base;
+    UINT32 Limit;
+    union
+    {
+        struct
+        {
+            UINT8 Flags1;
+            UINT8 Flags2;
+            UINT8 Flags3;
+            UINT8 Flags4;
+        } Bytes;
+        struct
+        {
+            UINT16 SegmentType : 4;
+            UINT16 DescriptorType : 1;
+            UINT16 Dpl : 2;
+            UINT16 Present : 1;
+
+            UINT16 Reserved : 4;
+            UINT16 System : 1;
+            UINT16 LongMode : 1;
+            UINT16 DefaultBig : 1;
+            UINT16 Granularity : 1;
+
+            UINT16 Unusable : 1;
+            UINT16 Reserved2 : 15;
+        } Bits;
+        UINT32 AccessRights;
+    };
+    UINT16 Selector;
+} VMX_GDTENTRY64, *PVMX_GDTENTRY64;
+
+typedef struct _VMX_VMCS
+{
+    UINT32 RevisionId;
+    UINT32 AbortIndicator;
+    UINT8 Data[PAGE_SIZE - 8];
+} VMX_VMCS, *PVMX_VMCS;
+
+typedef struct _VMX_EPTP
+{
+    union
+    {
+        struct
+        {
+            UINT64 Type : 3;
+            UINT64 PageWalkLength : 3;
+            UINT64 EnableAccessAndDirtyFlags : 1;
+            UINT64 Reserved : 5;
+            UINT64 PageFrameNumber : 36;
+            UINT64 ReservedHigh : 16;
+        };
+        UINT64 AsUlonglong;
+    };
+} VMX_EPTP, *PVMX_EPTP;
+
+typedef struct _VMX_EPML4E
+{
+    union
+    {
+        struct
+        {
+            UINT64 Read : 1;
+            UINT64 Write : 1;
+            UINT64 Execute : 1;
+            UINT64 Reserved : 5;
+            UINT64 Accessed : 1;
+            UINT64 SoftwareUse : 3;
+            UINT64 PageFrameNumber : 36;
+            UINT64 ReservedHigh : 4;
+            UINT64 SoftwareUseHigh : 12;
+        };
+        UINT64 AsUlonglong;
+    };
+} VMX_EPML4E, *PVMX_EPML4E;
+
+typedef struct _VMX_HUGE_PDPTE
+{
+    union
+    {
+        struct
+        {
+            UINT64 Read : 1;
+            UINT64 Write : 1;
+            UINT64 Execute : 1;
+            UINT64 Type : 3;
+            UINT64 IgnorePat : 1;
+            UINT64 Large : 1;
+            UINT64 Accessed : 1;
+            UINT64 Dirty : 1;
+            UINT64 SoftwareUse : 2;
+            UINT64 Reserved : 18;
+            UINT64 PageFrameNumber : 18;
+            UINT64 ReservedHigh : 4;
+            UINT64 SoftwareUseHigh : 11;
+            UINT64 SupressVme : 1;
+        };
+        UINT64 AsUlonglong;
+    };
+} VMX_HUGE_PDPTE, *PVMX_HUGE_PDPTE;
+
+static_assert(sizeof(VMX_EPTP) == sizeof(UINT64), "EPTP Size Mismatch");
+static_assert(sizeof(VMX_EPML4E) == sizeof(UINT64), "EPML4E Size Mismatch");
+
+#define PML4E_ENTRY_COUNT 512
+#define PDPTE_ENTRY_COUNT 512
+
 
